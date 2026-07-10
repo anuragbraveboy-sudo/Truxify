@@ -213,11 +213,18 @@ export class OrderRepository {
   async findLoadOffers(filters, options) {
     let query = this.supabase.from('load_offers').select('*');
     if (filters) {
-      for (const [col, val] of Object.entries(filters)) {
+      const { from, to, ...restFilters } = filters;
+      for (const [col, val] of Object.entries(restFilters)) {
         query = query.eq(col, val);
       }
+      query = query.order('created_at', { ascending: false });
+      if (from !== undefined && to !== undefined) {
+        query = query.range(from, to);
+      }
+    } else {
+      query = query.order('created_at', { ascending: false });
     }
-    return query.order('created_at', { ascending: false });
+    return query;
   }
 
   async updateLoadOffer(orderDisplayId, updates) {

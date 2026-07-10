@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { redisClient } from '../../config/db.js';
+import { supabase, redisClient } from '../../config/db.js';
 import logger from '../../middleware/logger.js';
 import {
   sendDeliveryOtpNotification,
@@ -8,11 +8,10 @@ import {
   verifyDeliveryOtp,
 } from '../notificationService.js';
 import { escrowRelease } from '../escrow.js';
-import { DomainError } from './bidAcceptanceService.js';
 import { OrderTimelineService } from './orderTimelineService.js';
+import { DomainError } from './domainError.js';
 
 const orderTimelineService = new OrderTimelineService({ supabase, logger });
-import { DomainError } from './domainError.js';
 
 export const OTP_TTL_MINUTES = parseInt(process.env.OTP_TTL_MINUTES || '15', 10);
 const OTP_MAX_FAILED_ATTEMPTS = parseInt(process.env.OTP_MAX_FAILED_ATTEMPTS || '5', 10);
@@ -92,8 +91,6 @@ export async function clearOtpState(orderId) {
 export class OrderMilestoneService {
   constructor(orderRepository) {
     this.orderRepository = orderRepository;
-  constructor({ orderValidationService } = {}) {
-    this.validation = orderValidationService;
   }
 
   async updateMilestone({ orderId, milestone, driverId }) {
@@ -114,8 +111,6 @@ export class OrderMilestoneService {
     if (orderErr || !order) throw new DomainError(404, { error: 'Order not found.' });
     if (order.driver_id !== driverId) throw new DomainError(403, { error: 'Access Denied: You are not assigned to this order.' });
 
-    const { data: timeline, error: tlErr } = await this.orderRepository.getTimelineWithSortCheck(order.order_display_id);
-    if (tlErr) throw new DomainError(500, { error: 'Failed to fetch order timeline.' });
     const timeline = await orderTimelineService.getOrderTimeline(order.order_display_id);
 
     const canonicalMilestones = new Set([...Object.keys(milestoneMap), 'Order Placed', 'Delivered']);

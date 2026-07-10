@@ -29,10 +29,7 @@ import {
   submitEscrowRefund,
   confirmEscrowRefund,
 } from '../services/escrow.js';
-import { BidAcceptanceService, DomainError } from '../services/order/bidAcceptanceService.js';
 import { DeliveryVerificationService } from '../services/order/deliveryVerificationService.js';
-import { expireDeliveryOtps } from '../services/notificationService.js';
-import { OrderTimelineService } from '../services/order/orderTimelineService.js';
 import { createOrder } from '../services/order/orderCreationService.js';
 import {
   sendDeliveryOtpNotification,
@@ -41,24 +38,17 @@ import {
   verifyDeliveryOtp,
   expireDeliveryOtps
 } from '../services/notificationService.js';
-import { predictDemand } from '../services/ml.js';
 import { BidAcceptanceService } from '../services/order/bidAcceptanceService.js';
 import { DomainError } from '../services/order/domainError.js';
 import { OrderValidationService } from '../services/order/orderValidationService.js';
 import { OrderMilestoneService } from '../services/order/orderMilestoneService.js';
-import { expireDeliveryOtps } from '../services/notificationService.js';
-import {
-  verifyDelivery,
-  resendDeliveryOtp,
-} from '../services/order/deliveryVerificationService.js';
+
 import { predictDemand, predictPrice } from '../services/ml.js';
 import { requireIdempotency } from '../middleware/idempotency.js';
 import logger from '../middleware/logger.js';
-import { OrderRepository } from '../repositories/orderRepository.js';
 import { OrderTimelineService } from '../services/order/orderTimelineService.js';
-import { BidAcceptanceService } from '../services/order/bidAcceptanceService.js';
 import { OrderLifecycleService } from '../services/order/orderLifecycleService.js';
-
+import { LoadOfferCacheService } from '../services/order/loadOfferCacheService.js';
 const router = express.Router();
 const orderRepository = new OrderRepository(supabase);
 
@@ -155,177 +145,7 @@ const changeDropLimiter = rateLimit({
 // 1. CREATE AN ORDER (CUSTOMER)
 // ============================================================================
 router.post('/', authenticate, userLimiter, requireRole(['customer']), validateBody(createOrderSchema), async (req, res) => {
-  const {
-    pickup_address, pickup_lat, pickup_lng,
-    drop_address, drop_lat, drop_lng,
-    goods_type, weight_tonnes,
-  } = req.body;
-
-  if (pickup_address && pickup_address.length > 200) {
-    return res.status(400).json({ error: 'pickup_address too long (max 200 chars)' });
-  }
-  if (drop_address && drop_address.length > 200) {
-    return res.status(400).json({ error: 'drop_address too long (max 200 chars)' });
-  }
-
-  if (!pickup_address || pickup_lat == null || pickup_lng == null || !drop_address || drop_lat == null || drop_lng == null || !goods_type || weight_tonnes == null) {
-    return res.status(400).json({ error: 'Missing required routing or cargo specification fields.' });
-  }
-
   try {
-    const routeEstimate = await getRouteEstimate({
-      pickupLat: Number(pickup_lat),
-      pickupLng: Number(pickup_lng),
-      dropLat: Number(drop_lat),
-      dropLng: Number(drop_lng),
-    });
-    pricing = computeOrderPricing({
-      pickupLat:  Number(pickup_lat),
-      pickupLng:  Number(pickup_lng),
-      dropLat:    Number(drop_lat),
-      dropLng:    Number(drop_lng),
-      weightTonnes: Number(weight_tonnes),
-      roadDistanceKm: routeEstimate?.distanceKm,
-      isFragile:   Boolean(is_fragile),
-      isStackable: Boolean(is_stackable),
-    });
-  } catch (pricingErr) {
-    logger.error('Pricing computation error:', pricingErr.message);
-    return res.status(400).json({
-      error: 'Unable to compute freight pricing for the given route/cargo.',
-      details: pricingErr.message,
-    });
-  }
-
-  let estimatedPrice = null;
-  try {
-    const mlResult = await predictPrice({
-      distanceKm: pricing.distanceKm,
-      cargoWeightKg: Number(weight_tonnes) * 1000,
-      routeOrigin: pickup_address,
-      routeDestination: drop_address,
-    });
-    if (!mlResult || typeof mlResult.estimated_price !== 'number' || mlResult.estimated_price <= 0) {
-      throw new Error(`Invalid or non-positive price prediction: ${JSON.stringify(mlResult)}`);
-    }
-    estimatedPrice = Math.round(mlResult.estimated_price * 100);
-  } catch (mlErr) {
-    logger.warn({ err: mlErr.message }, 'Price prediction unavailable, falling back to base pricing');
-  }
-
-  const MAX_ID_RETRIES = 3;
-  let order = null;
-  let orderErr = null;
-  let orderDisplayId = null;
-
-  try {
-    for (let attempt = 0; attempt < MAX_ID_RETRIES; attempt++) {
-      orderDisplayId = generateOrderDisplayId();
-      const result = await orderRepository
-        .createOrder({
-      const result = await supabase
-        .from('orders')
-        .insert({
-          order_display_id: orderDisplayId,
-          customer_id: req.user.id,
-          status: 'pending',
-          pickup_address, pickup_lat, pickup_lng,
-          drop_address, drop_lat, drop_lng,
-          pickup_date, pickup_time,
-          goods_type, weight_tonnes, length_ft, width_ft, height_ft,
-          is_stackable, is_fragile, special_requirements,
-          base_freight: pricing.baseFreight,
-          toll_estimate: pricing.tollEstimate,
-          platform_fee: pricing.platformFee,
-          total_amount: pricing.totalAmount,
-          estimated_price: estimatedPrice,
-          payment_method_id, upi_id
-        });
-        })
-        .select('id, order_display_id, status, created_at')
-        .single();
-
-      order = result.data;
-      orderErr = result.error;
-
-      if (!orderErr || orderErr.code !== '23505') break;
-      logger.warn(`[Orders] display ID collision on ${orderDisplayId}, retrying (attempt ${attempt + 1}/${MAX_ID_RETRIES})`);
-    }
-
-    if (orderErr) {
-      logger.error('Order Insertion Error:', orderErr.message);
-      return res.status(500).json({ error: 'Failed to create order record.', details: orderErr.message });
-    }
-
-    const milestones = [
-      { order_display_id: orderDisplayId, milestone: 'Order Placed', milestone_time: new Date().toISOString(), completed: true, sort_order: 10 },
-      { order_display_id: orderDisplayId, milestone: 'Truck Assigned', milestone_time: null, completed: false, sort_order: 20 },
-      { order_display_id: orderDisplayId, milestone: 'En Route to Pickup', milestone_time: null, completed: false, sort_order: 30 },
-      { order_display_id: orderDisplayId, milestone: 'Arrived at Pickup', milestone_time: null, completed: false, sort_order: 35 },
-      { order_display_id: orderDisplayId, milestone: 'Goods Loaded', milestone_time: null, completed: false, sort_order: 40 },
-      { order_display_id: orderDisplayId, milestone: 'In Transit', milestone_time: null, completed: false, sort_order: 50 },
-      { order_display_id: orderDisplayId, milestone: 'Arriving', milestone_time: null, completed: false, sort_order: 55 },
-      { order_display_id: orderDisplayId, milestone: 'Delivered', milestone_time: null, completed: false, sort_order: 60 }
-    ];
-
-    const { error: timelineErr } = await orderRepository.createTimeline(milestones);
-
-    if (timelineErr) {
-      logger.error('Timeline Insertion Error:', timelineErr.message);
-      await orderRepository.deleteOrder(order.id);
-      return res.status(500).json({ error: 'Failed to create order timeline.', details: timelineErr.message });
-    }
-
-    const { error: offerErr } = await orderRepository
-      .createLoadOffer({
-    try {
-      await orderTimelineService.createOrderTimeline(orderDisplayId);
-    } catch (timelineErr) {
-      await supabase.from('orders').delete().eq('id', order.id);
-      if (timelineErr instanceof DomainError) {
-        return res.status(timelineErr.status).json(timelineErr.payload);
-      }
-      return res.status(500).json({ error: 'Failed to create order timeline.', details: timelineErr.message });
-    }
-
-    const { error: offerErr } = await supabase
-      .from('load_offers')
-      .insert({
-        order_display_id: orderDisplayId,
-        customer_id: req.user.id,
-        customer_name: req.user.fullName || 'Customer',
-        route_label: `${pickup_address.split(',')[0]} → ${drop_address.split(',')[0]}`,
-        route_subtitle: `${weight_tonnes} tonnes • ${goods_type}`,
-        pickup_address, pickup_lat, pickup_lng,
-        drop_address, drop_lat, drop_lng,
-        goods_type,
-        weight: `${weight_tonnes} tonnes`,
-        freight_value: pricing.totalAmount,
-        fuel_cost: pricing.fuelCost,
-        toll_cost: pricing.tollEstimate,
-        net_profit: pricing.netProfit,
-        extra_distance_km: pricing.distanceKm,
-        status: 'available'
-      });
-
-    if (offerErr) {
-      logger.error('Load Offer Insertion Error:', offerErr.message);
-      await orderRepository.deleteTimeline(orderDisplayId);
-      await orderRepository.deleteOrder(order.id);
-      return res.status(500).json({ error: 'Failed to create load offer.', details: offerErr.message });
-    }
-
-      await orderTimelineService.deleteOrderTimeline(orderDisplayId);
-      await supabase.from('orders').delete().eq('id', order.id);
-      return res.status(500).json({ error: 'Failed to create load offer.', details: offerErr.message });
-    }
-
-    const result = await createOrder({
-      orderData: req.body,
-      userId: req.user.id,
-      user: req.user,
-    });
-    return res.status(201).json(result);
     const { order } = await orderLifecycleService.createOrder(req.user.id, req.user.fullName || 'Customer', req.body);
     res.status(201).json({ message: 'Order created successfully and broadcasted to loads board.', order });
   } catch (err) {
@@ -333,7 +153,7 @@ router.post('/', authenticate, userLimiter, requireRole(['customer']), validateB
       return res.status(err.status).json(err.payload);
     }
     logger.error('Order creation exception:', err.message);
-    return res.status(500).json({ error: 'Internal Server Error.' });
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
@@ -342,18 +162,6 @@ router.post('/', authenticate, userLimiter, requireRole(['customer']), validateB
 // ============================================================================
 router.get('/my/active', authenticate, userLimiter, requireRole(['customer']), async (req, res) => {
   try {
-    const { data: orders, error } = await orderRepository
-      .findOrdersByCustomer(req.user.id, '*', activeStatuses, 'pickup_date', false);
-
-    if (error) return res.status(500).json({ error: 'Failed to fetch active orders.', details: error.message });
-
-    const driverIds = [...new Set(orders.filter(o => o.driver_id).map(o => o.driver_id))];
-    if (driverIds.length > 0) {
-      const { data: profiles } = await orderRepository.findProfilesByIds(driverIds, 'id, full_name');
-      const driverMap = Object.fromEntries((profiles || []).map(p => [p.id, p.full_name]));
-      orders.forEach(o => { o.driver_name = driverMap[o.driver_id] || 'Driver Assigned'; });
-    }
-
     const orders = await orderLifecycleService.getActiveOrders(req.user.id);
     res.json(orders);
   } catch (err) {
@@ -371,18 +179,28 @@ router.get('/my/active', authenticate, userLimiter, requireRole(['customer']), a
 router.get('/load-offers', authenticate, userLimiter, async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+  const { lat, lng } = req.query;
   const from = (page - 1) * limit;
   const to = page * limit - 1;
+
   try {
-    const { data: offers, error } = await orderRepository.findLoadOffers({ is_en_route: false });
-    const { data: offers, error } = await supabase
-      .from('load_offers')
-      .select('*')
-      .eq('is_en_route', false)
-      .order('created_at', { ascending: false })
-      .range(from, to);
+    const region = LoadOfferCacheService.getRegion(lat, lng);
+    const version = await LoadOfferCacheService.getVersion(region);
+    const cacheKey = `cache:load_offers:region:${region}:v${version}:p${page}:l${limit}:enroute_false`;
+
+    if (redisClient) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) return res.json(JSON.parse(cached));
+    }
+
+    const { data: offers, error } = await orderRepository.findLoadOffers({ is_en_route: false, from, to });
 
     if (error) return res.status(500).json({ error: 'Failed to fetch load offers.', details: error.message });
+
+    if (redisClient) {
+      await redisClient.set(cacheKey, JSON.stringify(offers), 'EX', 120).catch(() => {});
+    }
+
     res.json(offers);
   } catch (err) {
     logger.error("[orderRoutes] Failed to fetch load offers:", err.message);
@@ -396,18 +214,28 @@ router.get('/load-offers', authenticate, userLimiter, async (req, res) => {
 router.get('/load-offers/en-route', authenticate, userLimiter, async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+  const { lat, lng } = req.query;
   const from = (page - 1) * limit;
   const to = page * limit - 1;
+
   try {
-    const { data: offers, error } = await orderRepository.findLoadOffers({ is_en_route: true });
-    const { data: offers, error } = await supabase
-      .from('load_offers')
-      .select('*')
-      .eq('is_en_route', true)
-      .order('created_at', { ascending: false })
-      .range(from, to);
+    const region = LoadOfferCacheService.getRegion(lat, lng);
+    const version = await LoadOfferCacheService.getVersion(region);
+    const cacheKey = `cache:load_offers:region:${region}:v${version}:p${page}:l${limit}:enroute_true`;
+
+    if (redisClient) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) return res.json(JSON.parse(cached));
+    }
+
+    const { data: offers, error } = await orderRepository.findLoadOffers({ is_en_route: true, from, to });
 
     if (error) return res.status(500).json({ error: 'Failed to fetch en-route loads.', details: error.message });
+
+    if (redisClient) {
+      await redisClient.set(cacheKey, JSON.stringify(offers), 'EX', 120).catch(() => {});
+    }
+
     res.json(offers);
   } catch (err) {
     logger.error("[orderRoutes] Failed to fetch en-route loads:", err.message);
@@ -470,22 +298,12 @@ router.get('/:id', authenticate, userLimiter, validateParams(paramIdSchema), asy
   const orderId = req.params.id;
 
   try {
-    const result = await orderRepository.findOrderByAnyId(orderId, '*');
-    const order = result.data;
-    const orderErr = result.error;
-    if (orderErr) return res.status(500).json({ error: 'Query failed.', details: orderErr.message });
-    if (!order) return res.status(404).json({ error: 'Order not found.' });
-
-    if (order.customer_id !== req.user.id && order.driver_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access Denied: You do not own this order.' });
-    }
     const order = await orderValidationService.findOrderByIdOrDisplayId(orderId, '*');
     orderValidationService.assertOrderFound(order);
     orderValidationService.assertOrderAccess(order, req.user.id);
 
     const responseOrder = { ...order };
 
-    const { data: timeline } = await orderRepository.getTimeline(order.order_display_id);
     const timeline = await orderTimelineService.getOrderTimeline(order.order_display_id);
 
     let driverProfile = null;
@@ -519,29 +337,10 @@ router.get('/:id/timeline', authenticate, userLimiter, validateParams(paramIdSch
   const orderId = req.params.id;
 
   try {
-    let order = null;
-    if (uuidRegex.test(orderId)) {
-      const { data: orderById } = await orderRepository.findOrderForTimeline(orderId);
-      order = orderById;
-    }
-    if (!order) {
-      const { data: orderByDisplay } = await orderRepository.findOrderByDisplayForTimeline(orderId);
-      order = orderByDisplay;
-    }
-
-    if (!order) return res.status(404).json({ error: 'Order not found.' });
-
-    if (order.customer_id !== req.user.id && order.driver_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access Denied: You do not own or are not assigned to this order.' });
-    }
     const order = await orderValidationService.findOrderByIdOrDisplayId(orderId, 'customer_id, driver_id, order_display_id');
     orderValidationService.assertOrderFound(order);
     orderValidationService.assertOrderAccess(order, req.user.id);
 
-    const { data: timeline, error: timelineErr } = await orderRepository.getTimeline(order.order_display_id);
-
-    if (timelineErr) return res.status(500).json({ error: 'Failed to fetch timeline.', details: timelineErr.message });
-    res.json(timeline || []);
     try {
       const timeline = await orderTimelineService.getOrderTimeline(order.order_display_id);
       res.json(timeline);
@@ -549,7 +348,7 @@ router.get('/:id/timeline', authenticate, userLimiter, validateParams(paramIdSch
       if (timelineErr instanceof DomainError) {
         return res.status(timelineErr.status).json(timelineErr.payload);
       }
-      return res.status(500).json({ error: 'Failed to fetch timeline.' });
+      throw timelineErr;
     }
   } catch (err) {
     if (err instanceof DomainError) {
@@ -565,22 +364,9 @@ router.get('/:id/timeline', authenticate, userLimiter, validateParams(paramIdSch
 // ============================================================================
 router.post('/:id/bids', authenticate, userLimiter, requireRole(['driver']), bidLimiter, validateParams(paramIdSchema), validateBody(submitBidSchema), async (req, res) => {
   try {
-    const { data: offer, error: offerErr } = await orderRepository.findLoadOfferById(loadOfferId);
-    if (offerErr || !offer) return res.status(404).json({ error: 'Load offer not found.' });
-    if (offer.status !== 'available') return res.status(410).json({ error: 'Load is no longer available for bidding.' });
-    if (offer.customer_id === req.user.id) return res.status(403).json({ error: 'You cannot bid on your own load offer' });
+    const loadOfferId = req.params.id;
+    const { bid_amount } = req.body;
 
-    const { data: driverDetails, error: driverDetailsErr } = await orderRepository.findDriverDetailMinimal(req.user.id);
-    if (driverDetailsErr) return res.status(500).json({ error: 'Failed to verify driver profile.', details: driverDetailsErr.message });
-    if (!driverDetails?.truck_id) return res.status(400).json({ error: 'You must assign a valid truck to your profile before bidding on loads' });
-
-    const { data: truck, error: truckErr } = await orderRepository.findTruckById(driverDetails.truck_id);
-    if (truckErr) return res.status(500).json({ error: 'Failed to verify assigned truck.', details: truckErr.message });
-    if (!truck) return res.status(400).json({ error: 'Assigned truck record could not be found' });
-
-    const { data: existingBid, error: existingBidErr } = await orderRepository.findExistingBid(loadOfferId, req.user.id, 'pending');
-    if (existingBidErr) return res.status(500).json({ error: 'Failed to verify existing bids.', details: existingBidErr.message });
-    if (existingBid) return res.status(409).json({ error: 'You already have a pending bid for this load.' });
     const offer = await orderValidationService.assertLoadOfferAvailable(loadOfferId);
     orderValidationService.assertNotOwnLoad(offer.customer_id, req.user.id);
     await orderValidationService.assertTruckAssigned(req.user.id);
@@ -604,37 +390,9 @@ router.post('/:id/bids', authenticate, userLimiter, requireRole(['driver']), bid
 // ============================================================================
 router.post('/:id/ratings', authenticate, userLimiter, requireRole(['customer']), validateParams(paramIdSchema), validateBody(submitRatingSchema), async (req, res) => {
   try {
-    const { data: order, error: orderErr } = await orderRepository.findOrderById(orderId, 'id, order_display_id, customer_id, driver_id, status');
+    const orderId = req.params.id;
+    const { stars, comment } = req.body;
 
-    if (orderErr) {
-      return res.status(500).json({ error: 'Failed to fetch order.', details: orderErr.message });
-    }
-
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found.' });
-    }
-
-    if (order.customer_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access Denied: You do not own this order.' });
-    }
-
-    if (!['delivered', 'payment_released'].includes(order.status)) {
-      return res.status(400).json({ error: 'Order must be delivered before a rating can be submitted.' });
-    }
-
-    if (!order.driver_id) {
-      return res.status(400).json({ error: 'Order does not have an assigned driver.' });
-    }
-
-    const { data: existingRating, error: ratingCheckErr } = await orderRepository.findRatingByOrder(order.order_display_id, req.user.id);
-
-    if (ratingCheckErr) {
-      return res.status(500).json({ error: 'Failed to verify existing rating.', details: ratingCheckErr.message });
-    }
-
-    if (existingRating) {
-      return res.status(409).json({ error: 'A rating has already been submitted for this order.' });
-    }
     const order = await orderValidationService.findOrderByIdOrDisplayId(orderId, 'id, order_display_id, customer_id, driver_id, status');
     orderValidationService.assertOrderFound(order);
     orderValidationService.assertCustomerOwnership(order, req.user.id);
@@ -702,8 +460,7 @@ router.post('/:id/ratings', authenticate, userLimiter, requireRole(['customer'])
 // ============================================================================
 router.get('/:id/bids', authenticate, userLimiter, requireRole(['customer']), validateParams(paramIdSchema), async (req, res) => {
   try {
-    const { data: order } = await orderRepository.findOrderById(orderId, 'order_display_id, customer_id');
-    if (!order || order.customer_id !== req.user.id) return res.status(403).json({ error: 'Access Denied: You do not own this order.' });
+    const orderId = req.params.id;
     const order = await orderValidationService.findOrderByIdOrDisplayId(orderId, 'order_display_id, customer_id');
     orderValidationService.assertOrderFound(order);
     orderValidationService.assertCustomerOwnership(order, req.user.id);
@@ -759,13 +516,7 @@ router.get('/:id/bids', authenticate, userLimiter, requireRole(['customer']), va
 // ============================================================================
 // 11. ACCEPT BID (CUSTOMER)
 // ============================================================================
-const bidAcceptanceService = new BidAcceptanceService({
-  supabase,
-  buildDepositTxFn: buildDepositTx,
-  recordDepositTxFn: recordDepositTx,
-  escrowRefundFn: escrowRefund,
-  logger
-});
+// Instantiated at top of file
 
 router.post('/:id/bids/:bidId/accept', authenticate, userLimiter, requireRole(['customer']), validateParams(acceptBidParamsSchema), async (req, res) => {
   try {
@@ -787,94 +538,6 @@ router.put('/:id/milestones', authenticate, userLimiter, requireRole(['driver'])
   const orderId = req.params.id;
   const { milestone } = req.body;
 
-  const milestoneMap = {
-    'Truck Assigned': 'truck_assigned',
-    'En Route to Pickup': 'en_route_pickup',
-    'Arrived at Pickup': 'arrived_pickup',
-    'Goods Loaded': 'picked_up',
-    'In Transit': 'in_transit',
-    'Arriving': 'arriving',
-  };
-
-  try {
-    if (milestone === 'Delivered') {
-      return res.status(400).json({ error: 'Cannot set Delivered milestone directly. Use /verify-delivery endpoint to confirm delivery.' });
-    }
-
-    const orderId = req.params.id;
-    const { milestone } = req.body;
-    const milestoneMap = {
-      'Arrived at Pickup': 'at_pickup',
-      'Goods Loaded': 'loaded',
-      'In Transit': 'in_transit',
-      'Arrived at Drop-off': 'at_dropoff',
-      'Goods Unloaded': 'at_dropoff'
-    };
-    const { data: order, error: orderErr } = await orderRepository.findOrderById(orderId, '*');
-    if (orderErr || !order) return res.status(404).json({ error: 'Order not found.' });
-    if (order.driver_id !== req.user.id) return res.status(403).json({ error: 'Access Denied: You are not assigned to this order.' });
-
-    const { data: timeline, error: tlErr } = await orderRepository.getTimelineWithSortCheck(order.order_display_id);
-    if (tlErr) return res.status(500).json({ error: 'Failed to fetch order timeline.' });
-    let timeline;
-    try {
-      timeline = await orderTimelineService.getOrderTimeline(order.order_display_id);
-    } catch (tlErr) {
-      return res.status(500).json({ error: 'Failed to fetch order timeline.' });
-    }
-
-    const canonicalMilestones = new Set([...Object.keys(milestoneMap), 'Order Placed', 'Delivered']);
-    const lastCompleted = [...timeline].reverse().find(t => t.completed && canonicalMilestones.has(t.milestone));
-    const lastCompletedSortOrder = lastCompleted ? lastCompleted.sort_order : 10;
-
-    const timelineEntry = timeline.find(t => t.milestone === milestone);
-    if (!timelineEntry) return res.status(400).json({ error: `Milestone "${milestone}" is not part of this order's timeline.` });
-
-    if (timelineEntry.completed) {
-      return res.status(409).json({ error: `Milestone "${milestone}" has already been completed.` });
-    }
-
-    const nextExpected = timeline.find(t => !t.completed && t.sort_order > lastCompletedSortOrder);
-    if (!nextExpected || nextExpected.sort_order !== timelineEntry.sort_order) {
-      return res.status(422).json({
-        error: `Milestone out of sequence. Expected "${nextExpected ? nextExpected.milestone : 'none'}" before "${milestone}".`,
-      });
-    }
-
-    const status = milestoneMap[milestone];
-    const updates = { status, updated_at: new Date().toISOString() };
-    let generatedOtp = null;
-
-    if (milestone === 'In Transit') {
-      const result = await deliveryVerificationService.generateDeliveryOtp({ orderId });
-      generatedOtp = result.otp;
-    }
-
-    const { error: timelineErr } = await orderRepository.updateTimelineMilestone(order.order_display_id, milestone, { completed: true, milestone_time: new Date().toISOString() });
-    if (timelineErr) return res.status(500).json({ error: 'Failed to update order timeline.', details: timelineErr.message });
-    try {
-      await orderTimelineService.completeMilestone(order.order_display_id, milestone);
-    } catch (timelineErr) {
-      if (timelineErr instanceof DomainError) {
-        return res.status(timelineErr.status).json(timelineErr.payload);
-      }
-      return res.status(500).json({ error: 'Failed to update order timeline.', details: timelineErr.message });
-    }
-
-    const { data: updatedOrder, error: updateErr } = await orderRepository.updateOrder(orderId, updates);
-    if (updateErr) {
-      // Roll back the timeline mark since the order update failed
-      await orderRepository.updateTimelineMilestone(order.order_display_id, milestone, { completed: false, milestone_time: null });
-      await orderTimelineService.resetMilestone(order.order_display_id, milestone);
-      return res.status(500).json({ error: 'Failed to update order.', details: updateErr.message });
-    }
-
-    if (generatedOtp) {
-      await deliveryVerificationService.sendOtpNotification({ orderId, customerId: order.customer_id, orderDisplayId: order.order_display_id, otp: generatedOtp });
-    }
-
-    const response = { message: 'Milestone updated successfully.', order: updatedOrder, milestone, status };
-
   try {
     const result = await orderMilestoneService.updateMilestone({ orderId, milestone, driverId: req.user.id });
     res.json({ message: 'Milestone updated successfully.', ...result });
@@ -892,11 +555,6 @@ router.put('/:id/milestones', authenticate, userLimiter, requireRole(['driver'])
 // ============================================================================
 router.post('/:id/verify-delivery', authenticate, userLimiter, requireRole(['driver']), verifyDeliveryLimiter, requireIdempotency(86400), validateParams(paramIdSchema), validateBody(verifyDeliverySchema), async (req, res) => {
   try {
-    const { escrowUpdateFailed } = await deliveryVerificationService.verifyDelivery({
-      orderId,
-      driverId: req.user.id,
-      otp,
-    });
     const { escrowUpdateFailed } = await orderLifecycleService.verifyDeliveryFn(req.params.id, req.user.id, req.body.otp);
 
     if (escrowUpdateFailed) {
@@ -922,9 +580,6 @@ router.post('/:id/verify-delivery', authenticate, userLimiter, requireRole(['dri
 // ============================================================================
 router.post('/:id/resend-otp', authenticate, userLimiter, resendOtpLimiter, requireRole(['driver']), validateParams(paramIdSchema), async (req, res) => {
   try {
-    const { data: order, error: orderErr } = await orderRepository.findOrderById(orderId, 'id, order_display_id, driver_id, customer_id, status');
-    if (orderErr || !order) return res.status(404).json({ error: 'Order not found.' });
-    if (order.driver_id !== req.user.id) return res.status(403).json({ error: 'Access Denied: You are not assigned to this order.' });
     const order = await orderValidationService.findOrderByIdOrDisplayId(orderId, 'id, order_display_id, driver_id, customer_id, status');
     orderValidationService.assertOrderFound(order);
     orderValidationService.assertDriverAssignment(order, req.user.id);
@@ -945,28 +600,14 @@ router.post('/:id/resend-otp', authenticate, userLimiter, resendOtpLimiter, requ
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
-
 // ============================================================================
 // 15. CHANGE DROP (CUSTOMER)
 // ============================================================================
 router.put('/:id/change-drop', authenticate, userLimiter, changeDropLimiter, requireRole(['customer']), validateParams(paramIdSchema), validateBody(changeDropSchema), async (req, res) => {
   try {
-    const orderResult = await orderRepository.findOrderByAnyId(orderId, '*');
-    const order = orderResult.data;
-    const orderErr = orderResult.error;
-    if (orderErr) return res.status(500).json({ error: 'Failed to fetch order.', details: orderErr.message });
-    if (!order) return res.status(404).json({ error: 'Order not found.' });
-    if (order.customer_id !== req.user.id) return res.status(403).json({ error: 'Access Denied: You do not own this order.' });
-    if (order.escrow_status === 'funded' || order.status !== 'pending') {
-      const reason = order.escrow_status === 'funded'
-        ? 'after escrow has been funded'
-        : `after order status is '${order.status}'`;
-      return res.status(409).json({
-        error: `Drop location cannot be changed ${reason}.`,
-        recovery: 'Cancel this order to receive a refund, then rebook with the correct destination.',
-      });
-    }
-    if (order.weight_tonnes == null) return res.status(500).json({ error: 'Data inconsistency: Order is missing weight_tonnes.' });
+    const orderId = req.params.id;
+    const { drop_address, drop_lat, drop_lng } = req.body;
+
     const order = await orderValidationService.findOrderByIdOrDisplayId(orderId, '*');
     orderValidationService.assertOrderFound(order);
     orderValidationService.assertCustomerOwnership(order, req.user.id);
@@ -1060,211 +701,14 @@ router.put('/:id/change-drop', authenticate, userLimiter, changeDropLimiter, req
 // ============================================================================
 router.post('/:id/cancel', authenticate, userLimiter, requireRole(['customer']), validateParams(paramIdSchema), validateBody(cancelOrderSchema), async (req, res) => {
   try {
-    const orderResult = await orderRepository.findOrderByAnyId(orderId, '*');
-    const order = orderResult.data;
-    const orderErr = orderResult.error;
-    if (orderErr) return res.status(500).json({ error: 'Failed to fetch order.', details: orderErr.message });
-    if (!order) return res.status(404).json({ error: 'Order not found.' });
-    if (order.customer_id !== req.user.id) return res.status(403).json({ error: 'Access Denied: You do not own this order.' });
-    const order = await orderValidationService.findOrderByIdOrDisplayId(orderId, '*');
-    orderValidationService.assertOrderFound(order);
-    orderValidationService.assertCustomerOwnership(order, req.user.id);
-    await orderValidationService.assertDeliveryNotVerified(order.id);
-
-    // Prevent cancellation if delivery OTP was already verified
-    const { data: otpCheck, error: otpCheckErr } = await orderRepository.findVerifiedDeliveryOtp(order.id);
-
-    if (!otpCheckErr && otpCheck) {
-      return res.status(409).json({ error: 'Cannot cancel: delivery OTP has already been verified.' });
-    }
-
-    if (order.status === 'cancelled' && order.escrow_status === 'refunded') {
-      return res.json({
-        message: 'Order was already cancelled and refunded.',
-        cancellation_fee: order.cancellation_fee ?? 0,
-        order,
-      });
-    }
-
-    const requiresRefund = ['funded', 'refund_pending', 'refund_failed'].includes(order.escrow_status);
-    let workingOrder = order;
-
-    // Persist cancellation before touching the blockchain. A failed or delayed
-    // refund must never leave the order available for continued work.
-    if (requiresRefund && (order.status !== 'cancelled' || order.escrow_status !== 'refund_pending')) {
-      const attemptAt = new Date().toISOString();
-      const { data: pendingOrder, error: pendingErr } = await orderRepository.updateOrderWithFilter(
-        order.id,
-        {
-          status: 'cancelled',
-          cancellation_reason: reason ?? order.cancellation_reason,
-          escrow_status: 'refund_pending',
-          escrow_refund_error: null,
-          escrow_refund_attempts: (order.escrow_refund_attempts ?? 0) + 1,
-          escrow_refund_last_attempt_at: attemptAt,
-          updated_at: attemptAt,
-        },
-        [
-          { op: 'not', column: 'status', operator: 'in', value: '("delivered","payment_released")' },
-        ]
-      );
-
-      if (pendingErr) {
-        if (pendingErr.code === 'PGRST116') {
-          return res.status(409).json({ error: 'Order was already delivered or payment released. Cannot cancel.' });
-        }
-        return res.status(500).json({
-          error: 'Failed to place the order into refund reconciliation.',
-          details: pendingErr.message,
-        });
-      }
-      workingOrder = pendingOrder;
-    }
-
-    if (requiresRefund) {
-      const lockKey = `escrow_lock:${workingOrder.id}`;
-      const lockValue = await acquireLock(lockKey, 30000);
-      if (!lockValue) {
-        return res.status(409).json({ error: 'Refund is currently being processed. Please try again later.' });
-      }
-
-      try {
-        let refundTxHash = workingOrder.refund_tx_hash ?? null;
-
-        try {
-          let receipt;
-
-          if (refundTxHash) {
-            receipt = await confirmEscrowRefund(refundTxHash);
-          } else {
-            const submitted = await submitEscrowRefund(order.order_display_id);
-            refundTxHash = submitted.txHash;
-            if (!refundTxHash || !submitted.waitForConfirmation) {
-              throw new Error('Escrow refund transaction was not submitted.');
-            }
-
-            const submittedAt = new Date().toISOString();
-            const { error: hashErr } = await orderRepository.updateOrderSelective(
-              order.id,
-              {
-                refund_tx_hash: refundTxHash,
-                escrow_refund_submitted_at: submittedAt,
-                updated_at: submittedAt,
-              },
-              '*'
-            );
-
-            if (hashErr) {
-              logger.error('[escrow] Failed to persist refund tx hash for order', orderId, ':', hashErr.message);
-            }
-            receipt = await submitted.waitForConfirmation();
-          }
-
-          const refundedAt = new Date().toISOString();
-          const { data: updatedOrder, error: updateErr } = await orderRepository.updateOrderWithFilter(
-            order.id,
-            {
-              status: 'cancelled',
-              cancellation_reason: reason ?? workingOrder.cancellation_reason,
-              escrow_status: 'refunded',
-              refund_tx_hash: receipt.hash ?? refundTxHash,
-              escrow_refunded_at: refundedAt,
-              escrow_refund_error: null,
-              updated_at: refundedAt,
-            },
-            [
-              { op: 'in', column: 'escrow_status', value: ['refund_pending', 'refund_failed'] },
-            ],
-            'cancellation_fee, order_display_id, status, cancellation_reason, escrow_status, refund_tx_hash'
-          );
-
-          if (updateErr) {
-            logger.error('[escrow] Refund confirmed but final order update failed for', orderId, ':', updateErr.message);
-            return res.status(202).json({
-              message: 'Order cancelled and escrow refund confirmed. Database reconciliation is pending.',
-              refund_tx_hash: receipt.hash ?? refundTxHash,
-              escrow_status: 'refund_pending',
-              reconciliation_required: true,
-            });
-          }
-
-          await orderRepository.updateTimelineMilestone(order.order_display_id, 'Order Placed', { completed: true, milestone_time: refundedAt });
-          await orderTimelineService.completeOrderPlacedMilestone(order.order_display_id, refundedAt);
-
-          await expireDeliveryOtps(order.id);
-
-          return res.json({
-            message: 'Order cancelled and escrow refunded successfully.',
-            cancellation_fee: updatedOrder?.cancellation_fee ?? 0,
-            order: updatedOrder,
-          });
-        } catch (refundErr) {
-          logger.error('[escrow] Refund failed for order', orderId, ':', refundErr.message);
-          const failedAt = new Date().toISOString();
-          const nextEscrowStatus = refundTxHash ? 'refund_pending' : 'refund_failed';
-          await orderRepository.updateOrder(order.id, {
-            status: 'cancelled',
-            escrow_status: nextEscrowStatus,
-            refund_tx_hash: refundTxHash,
-            escrow_refund_error: String(refundErr.message || refundErr).slice(0, 1000),
-            escrow_refund_last_attempt_at: failedAt,
-            updated_at: failedAt,
-          });
-
-          return res.status(202).json({
-            message: 'Order cancelled. Escrow refund requires reconciliation.',
-            escrow_status: nextEscrowStatus,
-            refund_tx_hash: refundTxHash,
-            retryable: true,
-          });
-        }
-      } finally {
-        await releaseLock(lockKey, lockValue);
-      }
-    } else if (order.escrow_booking_id) {
-      logger.info(`[escrow] Escrow not funded (status: ${order.escrow_status}) — skipping on-chain refund.`);
-    }
-
-    const updatePayload = {
-      status: 'cancelled',
-      cancellation_reason: reason,
-      updated_at: new Date().toISOString(),
-    };
-
-    const { data: updatedOrder, error: updateErr } = await orderRepository.updateOrderWithFilter(
-      order.id,
-      updatePayload,
-      [
-        { op: 'not', column: 'status', operator: 'in', value: '("delivered","payment_released","cancelled")' },
-      ],
-      'cancellation_fee, order_display_id, status, cancellation_reason, escrow_status'
-    );
-
-    if (updateErr) {
-      if (updateErr.code === 'PGRST116') {
-        return res.status(409).json({ error: 'Order was already cancelled, delivered, or payment released. Cannot cancel.' });
-      }
-      return res.status(500).json({ error: 'Failed to cancel order.', details: updateErr.message });
-    }
-
-    const cancellationFee = updatedOrder?.cancellation_fee ?? 0;
-
-    await orderRepository.updateTimelineMilestone(order.order_display_id, 'Order Placed', { completed: true, milestone_time: new Date().toISOString() });
-
-    await expireDeliveryOtps(order.id);
-
-    return res.json({ message: 'Order cancelled successfully.', cancellation_fee: cancellationFee, order: updatedOrder });
+    const orderId = req.params.id;
+    const { reason } = req.body;
+    
+    const result = await orderLifecycleService.cancelOrder(orderId, req.user.id, reason);
+    
     if (result.status === 202) {
       return res.status(202).json(result.body);
     }
-
-    const cancellationFee = updatedOrder?.cancellation_fee ?? 0;
-
-    await orderTimelineService.completeOrderPlacedMilestone(order.order_display_id);
-
-    await expireDeliveryOtps(order.id);
-
-    return res.json({ message: 'Order cancelled successfully.', cancellation_fee: cancellationFee, order: updatedOrder });
     return res.json(result.body);
   } catch (err) {
     if (err instanceof DomainError) {
@@ -1296,15 +740,6 @@ router.post('/:id/confirm-deposit', authenticate, userLimiter, requireRole(['cus
   }
 
   try {
-    const { data: order, error: fetchErr } = await orderRepository.findOrderById(orderId, 'id, order_display_id, customer_id, escrow_booking_id, escrow_status');
-
-    if (fetchErr || !order) return res.status(404).json({ error: 'Order not found' });
-    if (order.customer_id !== req.user.id) {
-      return res.status(403).json({ error: 'Access Denied: You do not own this order.' });
-    }
-    if (order.escrow_status !== 'funding') {
-      return res.status(400).json({ error: 'Order is not in funding state' });
-    }
     const order = await orderValidationService.findOrderByIdOrDisplayId(orderId, 'id, order_display_id, customer_id, escrow_booking_id, escrow_status');
     orderValidationService.assertOrderFound(order);
     orderValidationService.assertCustomerOwnership(order, req.user.id);
