@@ -56,6 +56,7 @@ import { requirePolicy } from '../middleware/requirePolicy.js';
 import { userLimiter } from '../middleware/rateLimiter.js';
 import logger from '../middleware/logger.js';
 import { loadFilterQuerySchema } from '../validation/loadSchemas.js';
+import { cacheRoute } from '../middleware/cache.js';
 import { validateParams } from '../middleware/validate.js';
 import { paramIdSchema, uuidParamSchema } from '../validation/requestSchemas.js';
 import { escapeLike } from '../lib/escapeLike.js';
@@ -149,7 +150,7 @@ function sanitizeLoadFilters(query) {
  *       400:
  *         description: Validation error
  */
-router.get('/', authenticate, userLimiter, requirePolicy('load-offer:browse'), async (req, res) => {
+router.get('/', authenticate, userLimiter, requirePolicy('load-offer:browse'), validateQuery(loadFilterQuerySchema), cacheRoute(3600), async (req, res) => {
   try {
     const filterResult = loadFilterQuerySchema.safeParse(req.query);
     if (!filterResult.success) {

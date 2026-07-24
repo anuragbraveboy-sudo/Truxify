@@ -85,7 +85,8 @@ import { authenticate } from '../middleware/auth.js';
 import { requirePolicy } from '../middleware/requirePolicy.js';
 import { userLimiter } from '../middleware/rateLimiter.js';
 import { validateParams, validateBody } from '../middleware/validate.js';
-import { uuidParamSchema, registerTruckSchema } from '../validation/requestSchemas.js';
+import { uuidParamSchema, registerTruckSchema, truckFilterQuerySchema } from '../validation/requestSchemas.js';
+import { cacheRoute } from '../middleware/cache.js';
 import { getRouteEstimate } from '../services/osrm.js';
 import { computeOrderPricing } from '../lib/pricing.js';
 import { predictPrice } from '../services/ml.js';
@@ -130,7 +131,7 @@ const router = express.Router();
  *             schema:
  *               $ref: '#/components/schemas/TruckTypesResponse'
  */
-router.get('/types', authenticate, userLimiter, (req, res) => {
+router.get('/types', authenticate, userLimiter, cacheRoute(3600), (req, res) => {
   return res.json({
     types: ['Open Body', 'Closed Body', 'Container', 'Refrigerated']
   });

@@ -351,3 +351,26 @@ export const shareTrackingSchema = z.object({}).strict();
 export const publicTrackingTokenSchema = z.object({
   token: z.string().min(1, 'Tracking token is required').max(512),
 });
+
+export const paginationQuerySchema = z.object({
+  page: z.preprocess((val) => (val ? Number(val) : 1), z.number().int().min(1).default(1)),
+  limit: z.preprocess((val) => (val ? Number(val) : 10), z.number().int().min(1).max(100).default(10))
+});
+export const daysQuerySchema = z.object({
+  days: z.preprocess((val) => (val ? Number(val) : 7), z.number().int().min(1).max(365).default(7))
+});
+export const earningsHistoryQuerySchema = z.object({
+  period: z.enum(['daily', 'weekly', 'monthly', 'yearly']).default('monthly'),
+  start_date: z.string().optional(),
+  end_date: z.string().optional()
+});
+export const truckFilterQuerySchema = z.object({
+  name: z.string().optional(),
+  min_capacity: z.preprocess((val) => (val ? Number(val) : undefined), z.number().optional()),
+  max_capacity: z.preprocess((val) => (val ? Number(val) : undefined), z.number().optional())
+});
+export const supportTicketQuerySchema = paginationQuerySchema.extend({
+  status: z.enum(['open', 'in_progress', 'resolved', 'closed']).optional(),
+  priority: z.enum(['low', 'medium', 'high', 'urgent']).optional()
+});
+
